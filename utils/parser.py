@@ -39,6 +39,25 @@ group3.add_argument(
     default="debug",
 )
 
+# EES paper additions: solver dispatch + reversible adjoint.
+group4 = generic_parser.add_argument_group('SDE solver arguments (EES paper)')
+group4.add_argument(
+    "--solver", type=str, default="geometric_euler",
+    choices=["geometric_euler", "cfees25"],
+    help="SDE integrator. Default geometric_euler matches Zeng et al. unchanged."
+)
+group4.add_argument(
+    "--adjoint", type=str, default="autograd",
+    choices=["autograd", "reversible"],
+    help="Backprop strategy. 'reversible' is only valid with --solver cfees25 "
+         "and provides the O(1)-memory adjoint that is the headline contribution."
+)
+group4.add_argument(
+    "--base-seed", type=int, default=-1,
+    help="Per-call SDE noise seed (for deterministic noise across runs). "
+         "-1 (default) draws fresh seeds via torch.randint each forward call."
+)
+
 def remove_argument(parser, arg):
     for action in parser._actions:
         opts = action.option_strings

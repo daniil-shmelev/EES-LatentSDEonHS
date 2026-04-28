@@ -3,15 +3,15 @@
 
 import torch
 from torch import Tensor
-from typing import Callable, Tuple
+from typing import Callable, List, Optional, Tuple, Union
 
 from torch.distributions import (
-    Distribution, 
-    register_kl, 
-    kl_divergence, 
+    Distribution,
+    register_kl,
+    kl_divergence,
     Normal)
 from core.power_spherical.distributions import PowerSpherical, HypersphericalUniform
-from core.sde_solvers import geometric_euler
+from core.sde_solvers import dispatch_solver, geometric_euler
 from utils.misc import vec_to_matrix
 
 
@@ -55,7 +55,10 @@ class PathDistribution(Distribution):
         t: Tensor,
         validate_args=False,
         kl_samples: int = 1,
-        solver: Callable = geometric_euler
+        solver: Union[Callable, str] = geometric_euler,
+        K_params: Optional[List[Tensor]] = None,
+        adjoint: str = "autograd",
+        base_seed: int = 0,
         ) -> None:
 
         assert p0.sample().device == sigma.device == t.device, 'Device mismatch'
@@ -72,6 +75,9 @@ class PathDistribution(Distribution):
         self.kl_samples = kl_samples
         self.group_dim, self.basis = self._generate_basis()
         self._solver = solver
+        self._K_params = K_params if K_params is not None else []
+        self._adjoint = adjoint
+        self._base_seed = base_seed
 
     @property
     def t(self) -> Tensor:
@@ -112,7 +118,22 @@ class PathDistribution(Distribution):
 
     def _integrate(self, z0: Tensor) -> Tensor:
         """Integrates the SDE forward, starting at the initial value z0.
+
+        Two paths:
+        * If ``self._solver`` is callable (legacy), invoke it with the upstream
+          signature ``solver(z0, Kt_pre, sigma, dt, basis)`` -- preserves
+          unchanged behavior for ``geometric_euler`` (the default).
+        * If ``self._solver`` is a string, route via ``dispatch_solver``, which
+          knows about the EES / RKMK(Heun) integrators and the reversible
+          adjoint added for the EES paper.
         """
+        if isinstance(self._solver, str):
+            return dispatch_solver(
+                z0, self._K, self._K_params, self.sigma, self.t, self.basis,
+                kind=self._solver,
+                adjoint=self._adjoint,
+                base_seed=self._base_seed,
+            )
         return self._solver(z0, self.Kt, self.sigma, self.dt, self.basis)
 
     def rsample(self, sample_shape: torch.Size = torch.Size()) -> Tensor:
@@ -192,9 +213,13 @@ class SOnPathDistribution(PathDistribution):
         t: Tensor,
         validate_args=False,
         kl_samples: int = 1,
-        solver: Callable = geometric_euler
+        solver: Union[Callable, str] = geometric_euler,
+        K_params: Optional[List[Tensor]] = None,
+        adjoint: str = "autograd",
+        base_seed: int = 0,
         ) -> None:
-        super().__init__(p0, K ,sigma, t, validate_args, kl_samples, solver)
+        super().__init__(p0, K, sigma, t, validate_args, kl_samples, solver,
+                         K_params=K_params, adjoint=adjoint, base_seed=base_seed)
 
     def _generate_basis(self) -> Tuple[int, Tensor]:
         """Generates the basis of so(n) that consists of the matrices e_i * e_j^T e_j * e_i^T.
@@ -216,14 +241,17 @@ class BrownianMotionOnSphere(SOnPathDistribution):
         t: Tensor,
         validate_args=False,
         kl_samples: int = 1,
-        solver: Callable = geometric_euler
+        solver: Union[Callable, str] = geometric_euler,
+        adjoint: str = "autograd",
+        base_seed: int = 0,
         ) -> None:
 
         p0 = HypersphericalUniform(dim, device=sigma.device, validate_args=validate_args)
         group_dim = int(dim*(dim-1)/2)
-        def K(tt: Tensor): 
+        def K(tt: Tensor):
             return torch.zeros(len(tt), group_dim, device=sigma.device)
-        super().__init__(p0, K, sigma, t, validate_args, kl_samples, solver)
+        super().__init__(p0, K, sigma, t, validate_args, kl_samples, solver,
+                         K_params=[], adjoint=adjoint, base_seed=base_seed)
 
 
 @register_kl(HypersphericalUniform, HypersphericalUniform)
@@ -283,9 +311,13 @@ class GLnPathDistribution(PathDistribution):
         t: Tensor,
         validate_args=False,
         kl_samples: int = 1,
-        solver: Callable = geometric_euler
+        solver: Union[Callable, str] = geometric_euler,
+        K_params: Optional[List[Tensor]] = None,
+        adjoint: str = "autograd",
+        base_seed: int = 0,
         ) -> None:
-        super(GLnPathDistribution, self).__init__(p0, K ,sigma, t, validate_args, kl_samples, solver)
+        super(GLnPathDistribution, self).__init__(p0, K, sigma, t, validate_args, kl_samples, solver,
+                                                  K_params=K_params, adjoint=adjoint, base_seed=base_seed)
 
     def _generate_basis(self) -> Tuple[int, Tensor]:
         group_dim = self.dim * self.dim

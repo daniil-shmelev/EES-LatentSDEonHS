@@ -18,6 +18,7 @@ import torch.optim as optim
 from torch.optim.lr_scheduler import CosineAnnealingLR
 
 from data.activity_provider import HumanActivityProvider
+from core.sde_solvers import geometric_euler
 from core.training import generic_train
 from core.models import (
     ELBO,
@@ -162,6 +163,25 @@ def main():
         inp_dim=args.z_dim, 
         out_dim=provider.input_dim, 
         n_layers=1)
+    # Solver dispatch: geometric_euler -> callable (legacy); other choices ->
+    # string identifier handled by core.sde_solvers.dispatch_solver.
+    if args.solver == "geometric_euler":
+        solver_arg = geometric_euler
+    else:
+        solver_arg = args.solver
+    if args.solver != "cfees25" and args.adjoint == "reversible":
+        raise ValueError(
+            f"--adjoint reversible is only valid with --solver cfees25, "
+            f"got --solver {args.solver}"
+        )
+    if args.solver == "cfees25" and args.adjoint == "autograd":
+        raise ValueError(
+            "--solver cfees25 --adjoint autograd is not a supported combination. "
+            "EES schemes are only exposed via the O(1)-memory reversible adjoint -- "
+            "the full-autograd CFEES path exists in the codebase only as a diagnostic "
+            "for unit tests (see core.cfees_solver.cfees25_forward_only)."
+        )
+    base_seed_arg = None if args.base_seed < 0 else int(args.base_seed)
     qzx_net = default_SOnPathDistributionEncoder(
         h_dim=args.h_dim,
         z_dim=args.z_dim,
@@ -169,6 +189,9 @@ def main():
         learnable_prior=args.learnable_prior,
         time_min=0.0,
         time_max=2.0 * desired_t[-1].item(),
+        solver=solver_arg,
+        adjoint=args.adjoint,
+        base_seed=base_seed_arg,
     )
     pxz_net = PathToGaussianDecoder(mu_map=recon_net, sigma_map=None, initial_sigma=1.0)
     aux_net = GenericMLP(

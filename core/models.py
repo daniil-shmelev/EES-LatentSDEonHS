@@ -28,6 +28,7 @@ from torch.distributions import (
 
 from core.power_spherical.distributions import PowerSpherical, HypersphericalUniform
 from core.pathdistribution import SOnPathDistribution, BrownianMotionOnSphere, PathDistribution
+from core.sde_solvers import geometric_euler
 from utils.misc import scatter_obs_and_msk
 
 
@@ -536,6 +537,9 @@ class SOnPathDistributionEncoder(nn.Module):
         time_fn: nn.Module,
         learnable_prior: bool = False,
         in_dim: int = 32,
+        solver=geometric_euler,
+        adjoint: str = "autograd",
+        base_seed: Optional[int] = None,
     ) -> None:
         super().__init__()
         self._loc_map = loc_map
@@ -544,12 +548,18 @@ class SOnPathDistributionEncoder(nn.Module):
         self._sigma = nn.Parameter(torch.tensor(0.1))
         self._learnable_prior = learnable_prior
         self.in_dim = in_dim
+        self._solver = solver
+        self._adjoint = adjoint
+        self._base_seed = base_seed
         if learnable_prior:
             self.prior_h = nn.Parameter(torch.randn(1, in_dim))
 
     def extra_repr(self) -> str:
-        return f"learnable prior={self._learnable_prior}"
-        
+        return (
+            f"learnable_prior={self._learnable_prior}, solver={self._solver!r}, "
+            f"adjoint={self._adjoint!r}"
+        )
+
     def forward(self, h: Tensor, t: Tensor) -> Tuple[PathDistribution, PathDistribution]:
         """Forward pass through the model.
 
@@ -566,21 +576,52 @@ class SOnPathDistributionEncoder(nn.Module):
                 and prior path distribution objects.
         """
         loc = self._loc_map(h)
-        scl = self._scl_map(h)        
+        scl = self._scl_map(h)
         scl = scl.square() * 100.0
         scl = torch.minimum(scl, torch.tensor(50000.0, device=scl.device))
         p0 = PowerSpherical(F.normalize(loc), scl.squeeze(dim=1))
 
         def K(arg_t: Tensor) -> Tensor: return self._time_fn(h, arg_t)
-        posterior = SOnPathDistribution(p0, K, self._sigma, t)
+        # Tensors that K closes over -- needed by the reversible adjoint to route
+        # gradients back. Order: encoder output h first, then time_fn parameters.
+        time_fn_params = [p for p in self._time_fn.parameters()]
+        K_params = [h, *time_fn_params]
+
+        # Per-call base_seed: use the encoder default if set; otherwise draw a
+        # fresh int from the global RNG so each forward call gets independent
+        # noise (the reversible adjoint re-derives the same noise within one
+        # call from the per-call seed).
+        if self._base_seed is None:
+            base_seed = int(torch.randint(0, 2**31 - 1, (1,), device="cpu").item())
+        else:
+            base_seed = self._base_seed
+        # Posterior + prior must use distinct seeds so their Brownian paths are
+        # independent. The (1<<20) factor in step_noise gives plenty of room.
+        posterior_seed = base_seed
+        prior_seed = base_seed ^ 0xA5A5A5A5
+
+        posterior = SOnPathDistribution(
+            p0, K, self._sigma, t,
+            solver=self._solver, K_params=K_params,
+            adjoint=self._adjoint, base_seed=posterior_seed,
+        )
 
         if self._learnable_prior:
             prior_p0 = HypersphericalUniform(loc.shape[1], h.device, h.dtype)
-            def prior_K(arg_t: Tensor) -> Tensor: 
+            def prior_K(arg_t: Tensor) -> Tensor:
                 return self._time_fn(self.prior_h, arg_t)
-            prior = SOnPathDistribution(prior_p0, prior_K, self._sigma, t)
+            prior_K_params = [self.prior_h, *time_fn_params]
+            prior = SOnPathDistribution(
+                prior_p0, prior_K, self._sigma, t,
+                solver=self._solver, K_params=prior_K_params,
+                adjoint=self._adjoint, base_seed=prior_seed,
+            )
         else:
-            prior = BrownianMotionOnSphere(loc.shape[-1], self._sigma, t)
+            prior = BrownianMotionOnSphere(
+                loc.shape[-1], self._sigma, t,
+                solver=self._solver,
+                adjoint=self._adjoint, base_seed=prior_seed,
+            )
         return posterior, prior
 
 
@@ -1094,6 +1135,9 @@ def default_SOnPathDistributionEncoder(
     learnable_prior: bool = False,
     time_min: float = 0.0,
     time_max: float = 1.0,
+    solver=geometric_euler,
+    adjoint: str = "autograd",
+    base_seed: Optional[int] = None,
 ) -> SOnPathDistributionEncoder:
     """Implements the default SOnPathDistributionEncoder encoder we use 
     throughout all experiments, where the time function is parametrized 
@@ -1125,7 +1169,8 @@ def default_SOnPathDistributionEncoder(
     scl_map = nn.Linear(h_dim, 1)
     time_fn = Chebyshev(h_dim, n_deg, group_dim, time_min=time_min, time_max=time_max)
     return SOnPathDistributionEncoder(
-        loc_map, scl_map, time_fn, learnable_prior=learnable_prior, in_dim=h_dim
+        loc_map, scl_map, time_fn, learnable_prior=learnable_prior, in_dim=h_dim,
+        solver=solver, adjoint=adjoint, base_seed=base_seed,
     )
 
 
