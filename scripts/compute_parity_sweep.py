@@ -265,6 +265,12 @@ def main():
     parser.add_argument("--mc-eval-samples", type=int, default=1)
     parser.add_argument("--data-dir", default="data_dir")
     parser.add_argument(
+        "--download", action="store_true",
+        help="Download the UCI Human Activity dataset if it's not already at "
+             "--data-dir. Off by default; turn on the first time you run on a "
+             "machine without the data."
+    )
+    parser.add_argument(
         "--resume", action="store_true",
         help="If set and the output CSV already exists, skip (solver, B, seed) "
              "cells already present. Useful for long runs that may be interrupted."
@@ -308,7 +314,7 @@ def main():
     os.makedirs(os.path.dirname(args.out), exist_ok=True)
     if args.checkpoint_dir:
         os.makedirs(args.checkpoint_dir, exist_ok=True)
-    provider = HumanActivityProvider(args.data_dir)
+    provider = HumanActivityProvider(args.data_dir, download=args.download)
 
     # Resume support: load any rows that are already present in the output CSV.
     rows = []
