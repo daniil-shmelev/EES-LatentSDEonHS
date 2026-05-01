@@ -24,6 +24,7 @@ import matplotlib
 
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
+import numpy as np
 
 REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 DEFAULT_MEMORY_CSV = os.path.join(REPO_ROOT, "results", "memory_sweep_integrator.csv")
@@ -31,21 +32,41 @@ DEFAULT_FULL_PIPE_CSV = os.path.join(REPO_ROOT, "results", "memory_sweep.csv")
 DEFAULT_PARITY_CSV = os.path.join(REPO_ROOT, "results", "compute_parity.csv")
 DEFAULT_OUT_DIR = os.path.join(REPO_ROOT, "figures")
 
-# Style
-COLORS = {
-    "geometric_euler/autograd": "#d62728",
-    "geometric_euler/checkpoint": "#ff7f0e",
-    "cfees25/reversible": "#1f77b4",
-    "geometric_euler": "#d62728",
-    "cfees25": "#1f77b4",
+# Headline-figure style: matches the RNA torus memory plot
+# (experiments/rna/plots.py::fig_torus_scaling) so the two manifold-SDE
+# memory figures share a visual language.
+SCALING_MODE_LABEL = {
+    "cfees25/reversible": r"CF-EES(2,5) + Reversible Adj.",
+    "geometric_euler/autograd": r"Geo-Euler + Full Adj.",
+    "geometric_euler/checkpoint": r"Geo-Euler + Recursive Adj.",
 }
-LABELS = {
-    "geometric_euler/autograd": "Geo-Euler + full autograd",
-    "geometric_euler/checkpoint": "Geo-Euler + grad. checkpoint",
-    "cfees25/reversible": "CFEES + reversible adjoint",
-    "geometric_euler": "Geo-Euler",
-    "cfees25": "CFEES",
+SCALING_MODE_COLOR = {
+    "cfees25/reversible": "#d62728",
+    "geometric_euler/autograd": "#1f77b4",
+    "geometric_euler/checkpoint": "#1f77b4",
 }
+SCALING_MODE_MARKER = {
+    "cfees25/reversible": "o",
+    "geometric_euler/autograd": "s",
+    "geometric_euler/checkpoint": "D",
+}
+SCALING_MODE_LINESTYLE = {
+    "cfees25/reversible": "-",
+    "geometric_euler/autograd": "-",
+    "geometric_euler/checkpoint": "--",
+}
+
+
+def _set_stix_params(small: int = 8, medium: int = 9, bigger: int = 10) -> None:
+    plt.rcParams["mathtext.fontset"] = "stix"
+    plt.rcParams["font.family"] = "STIXGeneral"
+    plt.rc("font", size=small)
+    plt.rc("axes", titlesize=bigger)
+    plt.rc("axes", labelsize=medium)
+    plt.rc("xtick", labelsize=small)
+    plt.rc("ytick", labelsize=small)
+    plt.rc("legend", fontsize=small)
+    plt.rc("figure", titlesize=bigger)
 
 
 def _to_float(s):
@@ -58,9 +79,17 @@ def _to_float(s):
 
 
 def plot_memory(csv_path: str, out_path: str) -> None:
+    """Memory-vs-N plot in the same style as the RNA-torus Figure 1
+    (`experiments/rna/plots.py::fig_torus_scaling`).
+
+    Plots absolute peak GPU memory in MiB on log-log axes. Reference
+    slopes O(n), O(sqrt(n)) (where applicable) and O(1) annotations
+    are anchored to the rightmost point of each curve.
+    """
     if not os.path.exists(csv_path):
         print(f"  no memory sweep CSV at {csv_path}, skipping memory plot")
         return
+    _set_stix_params(8, 9, 10)
     rows = []
     with open(csv_path) as f:
         for row in csv.DictReader(f):
@@ -70,29 +99,66 @@ def plot_memory(csv_path: str, out_path: str) -> None:
         key = f"{r['kind']}/{r['adjoint']}"
         grouped[key].append((int(r["N"]), _to_float(r["peak_alloc_mib"]), r["status"]))
 
-    fig, ax = plt.subplots(figsize=(5.5, 3.8))
-    for key, entries in grouped.items():
-        entries.sort(key=lambda x: x[0])
-        Ns_ok = [e[0] for e in entries if e[2] == "ok"]
-        mibs_ok = [e[1] for e in entries if e[2] == "ok"]
-        if not Ns_ok:
+    # Plot order mirrors the RNA Figure 1: CFEES first (so it's not over-drawn),
+    # then the linear-tape baselines.
+    plot_order = [
+        "cfees25/reversible",
+        "geometric_euler/autograd",
+        "geometric_euler/checkpoint",
+    ]
+
+    fig, ax = plt.subplots(figsize=(3.2, 2.2))
+    plotted = {}
+    for key in plot_order:
+        if key not in grouped:
             continue
-        ax.plot(Ns_ok, mibs_ok, marker="o", color=COLORS.get(key, "k"),
-                label=LABELS.get(key, key), linewidth=2)
-        for N, mib, status in entries:
-            if status == "oom":
-                ax.annotate("OOM", xy=(N, max(mibs_ok) if mibs_ok else 1e3),
-                            xytext=(0, 6), textcoords="offset points",
-                            ha="center", color=COLORS.get(key, "k"), fontsize=8)
+        entries = sorted(grouped[key], key=lambda x: x[0])
+        Ns = np.asarray([e[0] for e in entries if e[2] == "ok"], dtype=float)
+        mibs = np.asarray([e[1] for e in entries if e[2] == "ok"], dtype=float)
+        if Ns.size == 0:
+            continue
+        plotted[key] = (Ns, mibs)
+        ax.plot(
+            Ns, mibs,
+            marker=SCALING_MODE_MARKER.get(key, "o"),
+            markersize=3, linewidth=1.2,
+            color=SCALING_MODE_COLOR.get(key, "k"),
+            linestyle=SCALING_MODE_LINESTYLE.get(key, "-"),
+            label=SCALING_MODE_LABEL.get(key, key),
+        )
+
+    # Reference O(n) line anchored to the rightmost point of the
+    # geometric-Euler curve (whose theoretical scaling it represents).
+    # CFEES gets an O(1) annotation against its own rightmost point.
+    if "geometric_euler/autograd" in plotted:
+        Ns, mibs = plotted["geometric_euler/autograd"]
+        # Anchor the O(n) reference to the slope between the first two large-N
+        # points (where the linear regime dominates) rather than to the
+        # constant-overhead small-N regime.
+        x_anchor, y_anchor = float(Ns[-1]), float(mibs[-1])
+        if Ns.size >= 2 and y_anchor > 0.0:
+            x_ref = np.asarray([float(Ns[0]), x_anchor])
+            y_ref = y_anchor * (x_ref / x_anchor)  # slope 1 in log-log
+            ax.plot(x_ref, y_ref, color="#444444", linewidth=1.2,
+                    linestyle=":", alpha=1.0, zorder=1)
+            ax.annotate(r"$\mathcal{O}(n)$", xy=(x_anchor, y_anchor),
+                        xytext=(12, 0), textcoords="offset points",
+                        fontsize=9, color="black",
+                        ha="left", va="center", annotation_clip=False)
+    if "cfees25/reversible" in plotted:
+        Ns, mibs = plotted["cfees25/reversible"]
+        ax.annotate(r"$\mathcal{O}(1)$",
+                    xy=(float(Ns[-1]), float(mibs[-1])),
+                    xytext=(12, 0), textcoords="offset points",
+                    fontsize=9, color="black",
+                    ha="left", va="center", annotation_clip=False)
+
     ax.set_xscale("log")
     ax.set_yscale("log")
-    ax.set_xlabel("Integrator steps $N$")
-    ax.set_ylabel("Peak GPU memory (MiB)")
-    ax.set_title(r"SDE integrator memory vs. $N$ -- $S^{15}$, batch=64")
-    ax.grid(False)
-    ax.legend(loc="upper left", fontsize=9)
-    fig.tight_layout()
-    fig.savefig(out_path, bbox_inches="tight")
+    ax.set_xlabel(r"$N$")
+    ax.set_ylabel(r"Peak GPU memory (MiB)")
+    ax.legend(loc="upper left", frameon=True, fontsize=7)
+    fig.savefig(out_path, bbox_inches="tight", pad_inches=0.04)
     plt.close(fig)
     print(f"  wrote {out_path}")
 

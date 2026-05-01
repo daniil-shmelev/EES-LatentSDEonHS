@@ -540,6 +540,7 @@ class SOnPathDistributionEncoder(nn.Module):
         solver=geometric_euler,
         adjoint: str = "autograd",
         base_seed: Optional[int] = None,
+        kl_subsample_M: Optional[int] = None,
     ) -> None:
         super().__init__()
         self._loc_map = loc_map
@@ -551,6 +552,7 @@ class SOnPathDistributionEncoder(nn.Module):
         self._solver = solver
         self._adjoint = adjoint
         self._base_seed = base_seed
+        self._kl_subsample_M = kl_subsample_M
         if learnable_prior:
             self.prior_h = nn.Parameter(torch.randn(1, in_dim))
 
@@ -604,6 +606,7 @@ class SOnPathDistributionEncoder(nn.Module):
             p0, K, self._sigma, t,
             solver=self._solver, K_params=K_params,
             adjoint=self._adjoint, base_seed=posterior_seed,
+            kl_subsample_M=self._kl_subsample_M,
         )
 
         if self._learnable_prior:
@@ -615,12 +618,14 @@ class SOnPathDistributionEncoder(nn.Module):
                 prior_p0, prior_K, self._sigma, t,
                 solver=self._solver, K_params=prior_K_params,
                 adjoint=self._adjoint, base_seed=prior_seed,
+                kl_subsample_M=self._kl_subsample_M,
             )
         else:
             prior = BrownianMotionOnSphere(
                 loc.shape[-1], self._sigma, t,
                 solver=self._solver,
                 adjoint=self._adjoint, base_seed=prior_seed,
+                kl_subsample_M=self._kl_subsample_M,
             )
         return posterior, prior
 
@@ -1138,6 +1143,7 @@ def default_SOnPathDistributionEncoder(
     solver=geometric_euler,
     adjoint: str = "autograd",
     base_seed: Optional[int] = None,
+    kl_subsample_M: Optional[int] = None,
 ) -> SOnPathDistributionEncoder:
     """Implements the default SOnPathDistributionEncoder encoder we use 
     throughout all experiments, where the time function is parametrized 
@@ -1171,6 +1177,7 @@ def default_SOnPathDistributionEncoder(
     return SOnPathDistributionEncoder(
         loc_map, scl_map, time_fn, learnable_prior=learnable_prior, in_dim=h_dim,
         solver=solver, adjoint=adjoint, base_seed=base_seed,
+        kl_subsample_M=kl_subsample_M,
     )
 
 

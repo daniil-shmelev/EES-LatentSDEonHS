@@ -59,6 +59,7 @@ class PathDistribution(Distribution):
         K_params: Optional[List[Tensor]] = None,
         adjoint: str = "autograd",
         base_seed: int = 0,
+        kl_subsample_M: Optional[int] = None,
         ) -> None:
 
         assert p0.sample().device == sigma.device == t.device, 'Device mismatch'
@@ -68,6 +69,10 @@ class PathDistribution(Distribution):
         event_shape = t.shape + p0.sample().shape[1:2]
         super(PathDistribution, self).__init__(batch_shape = batch_shape, event_shape=event_shape, validate_args=validate_args)
 
+        # _adjoint / kl_subsample_M must be set BEFORE self.t = t so the
+        # t.setter can decide whether to precompute Kt or defer.
+        self._adjoint = adjoint
+        self.kl_subsample_M = kl_subsample_M
         self.p0 = p0
         self._K = K
         self.sigma = sigma.flatten()
@@ -76,8 +81,22 @@ class PathDistribution(Distribution):
         self.group_dim, self.basis = self._generate_basis()
         self._solver = solver
         self._K_params = K_params if K_params is not None else []
-        self._adjoint = adjoint
         self._base_seed = base_seed
+
+    def _needs_Kt(self) -> bool:
+        """Whether to precompute self._Kt at construction time.
+
+        We can skip the precomputation when (a) the integrator does not
+        consume self.Kt (i.e. cfees25 + reversible adjoint, which calls
+        the K closure directly inside the reversible-adjoint chain) and
+        (b) the path-KL is being Monte-Carlo subsampled (so the KL only
+        needs K evaluated at M random timepoints, not all N). Skipping
+        the precomputation removes the O(N) activation cost from the
+        time_fn neural network, which is the dominant memory term in
+        the full Latent-SDE pipeline.
+        """
+        return not (self._adjoint == "reversible"
+                    and getattr(self, "kl_subsample_M", None) is not None)
 
     @property
     def t(self) -> Tensor:
@@ -86,7 +105,7 @@ class PathDistribution(Distribution):
     def t(self, val: Tensor) -> None:
         self._t = val
         self.dt = torch.diff(self.t)
-        self._Kt = self._K(self.t[:-1])
+        self._Kt = self._K(self.t[:-1]) if self._needs_Kt() else None
 
     @property
     def K(self) -> Callable[[Tensor], Tensor]:
@@ -94,7 +113,7 @@ class PathDistribution(Distribution):
     @K.setter
     def K(self, val: Callable[[Tensor], Tensor]):
         self._K = val
-        self._Kt = self._K(self.t[:-1])
+        self._Kt = self._K(self.t[:-1]) if self._needs_Kt() else None
 
     @property
     def steps(self) -> int:
@@ -148,22 +167,75 @@ class PathDistribution(Distribution):
         return f"{type(self).__name__}(batch_shape={list(self.batch_shape)}, steps={self.steps}, dim={self.dim})"
 
 
+def _resolve_Kt(d: 'PathDistribution', idx: Optional[Tensor] = None) -> Tensor:
+    """Return Kt at the given (sub)set of timepoints.
+
+    When ``idx`` is ``None``, returns the full-grid Kt -- precomputed if
+    available, otherwise re-evaluated. When ``idx`` is provided, returns
+    Kt at the indexed timepoints, evaluating the K closure fresh so that
+    only those M timepoints enter the autograd graph.
+    """
+    if idx is None:
+        if d._Kt is not None:
+            return d._Kt
+        return d._K(d.t[:-1])
+    return d._K(d.t[:-1][idx])
+
+
+def _kl_subsample_setup(p: 'PathDistribution', q: 'PathDistribution', zi: Tensor, M: int):
+    """Common setup for the subsampled-KL Monte-Carlo estimator: pick M
+    indices from the integrator grid, evaluate ``K_p`` and ``K_q`` and
+    slice the trajectory at those indices. Returns ``(Kt_p, Kt_q, zi_sub,
+    T_over_M)`` where ``T_over_M`` is the per-sample weight that turns
+    ``Σ_{i=1..M} ‖integrand(t_i)‖²`` into an unbiased estimate of
+    ``∫₀^T ‖integrand(t)‖² dt``.
+    """
+    N = len(p.dt)
+    idx = torch.randperm(N, device=p.t.device)[:M]
+    Kt_p = _resolve_Kt(p, idx)
+    Kt_q = _resolve_Kt(q, idx)
+    zi_sub = zi[..., :-1, :][..., idx, :]
+    T = p.t[-1] - p.t[0]
+    return Kt_p, Kt_q, zi_sub, T / M
+
+
 @register_kl(PathDistribution, PathDistribution)
 def _kl_pathdistributions(p: PathDistribution, q:PathDistribution) -> Tuple[Tensor, Tensor]:
     assert torch.all(p.basis == q.basis) and p.sigma == q.sigma, "Diffusion terms do not agree"
     kl0 = kl_divergence(p.p0, q.p0) # kl-div of initial values
 
+    M = getattr(p, 'kl_subsample_M', None)
+    N = len(p.dt)
     zi = p.zi if hasattr(p, 'zi') else p.rsample((p.kl_samples,))
-    diffusion = torch.einsum('dij, ...btj -> ...btdi', p.basis, zi[...,:-1,:]) * p.sigma
-    diffusion = torch.einsum('...btdi, ...btdj -> ...btij', diffusion, diffusion)
+
+    if M is None or M >= N:
+        Kt_p = _resolve_Kt(p)
+        Kt_q = _resolve_Kt(q)
+        diffusion = torch.einsum('dij, ...btj -> ...btdi', p.basis, zi[...,:-1,:]) * p.sigma
+        diffusion = torch.einsum('...btdi, ...btdj -> ...btij', diffusion, diffusion)
+        diff_pinv = torch.linalg.pinv(diffusion)
+
+        delta_drift = vec_to_matrix(Kt_p - Kt_q, p.basis)
+        proj_drift = torch.einsum('...btij, ...btj -> ...bti ',delta_drift,zi[...,:-1,:])
+        kl_path = torch.einsum('...i, ...ij, ...j -> ...', proj_drift, diff_pinv, proj_drift)
+
+        kl_path = torch.einsum('...nt,t -> ...n', kl_path, p.dt) # average over time
+        kl_path = kl_path.mean(dim=0) # average over samples
+        return kl_path, kl0
+
+    # Subsampled MC estimator: ∫₀^T ‖integrand(t)‖² dt  ≈  (T/M) · Σ_{i=1..M} ‖integrand(t_i)‖²
+    # with t_i drawn uniformly without replacement from the integrator's grid.
+    Kt_p, Kt_q, zi_sub, T_over_M = _kl_subsample_setup(p, q, zi, M)
+    diffusion = torch.einsum('dij, ...nmj -> ...nmdi', p.basis, zi_sub) * p.sigma
+    diffusion = torch.einsum('...nmdi, ...nmdj -> ...nmij', diffusion, diffusion)
     diff_pinv = torch.linalg.pinv(diffusion)
 
-    delta_drift = vec_to_matrix(p.Kt-q.Kt, p.basis)
-    proj_drift = torch.einsum('...btij, ...btj -> ...bti ',delta_drift,zi[...,:-1,:])
-    kl_path = torch.einsum('...i, ...ij, ...j -> ...', proj_drift, diff_pinv, proj_drift)
+    delta_drift = vec_to_matrix(Kt_p - Kt_q, p.basis)   # (batch, M, dim, dim)
+    proj_drift = torch.einsum('nmij, ...nmj -> ...nmi', delta_drift, zi_sub)
+    kl_path = torch.einsum('...nmi, ...nmij, ...nmj -> ...nm', proj_drift, diff_pinv, proj_drift)
 
-    kl_path = torch.einsum('...nt,t -> ...n', kl_path, p.dt) # average over time
-    kl_path = kl_path.mean(dim=0) # average over samples
+    kl_path = kl_path.sum(dim=-1) * T_over_M
+    kl_path = kl_path.mean(dim=0)
     return kl_path, kl0
 
 
@@ -217,9 +289,11 @@ class SOnPathDistribution(PathDistribution):
         K_params: Optional[List[Tensor]] = None,
         adjoint: str = "autograd",
         base_seed: int = 0,
+        kl_subsample_M: Optional[int] = None,
         ) -> None:
         super().__init__(p0, K, sigma, t, validate_args, kl_samples, solver,
-                         K_params=K_params, adjoint=adjoint, base_seed=base_seed)
+                         K_params=K_params, adjoint=adjoint, base_seed=base_seed,
+                         kl_subsample_M=kl_subsample_M)
 
     def _generate_basis(self) -> Tuple[int, Tensor]:
         """Generates the basis of so(n) that consists of the matrices e_i * e_j^T e_j * e_i^T.
@@ -244,6 +318,7 @@ class BrownianMotionOnSphere(SOnPathDistribution):
         solver: Union[Callable, str] = geometric_euler,
         adjoint: str = "autograd",
         base_seed: int = 0,
+        kl_subsample_M: Optional[int] = None,
         ) -> None:
 
         p0 = HypersphericalUniform(dim, device=sigma.device, validate_args=validate_args)
@@ -251,7 +326,8 @@ class BrownianMotionOnSphere(SOnPathDistribution):
         def K(tt: Tensor):
             return torch.zeros(len(tt), group_dim, device=sigma.device)
         super().__init__(p0, K, sigma, t, validate_args, kl_samples, solver,
-                         K_params=[], adjoint=adjoint, base_seed=base_seed)
+                         K_params=[], adjoint=adjoint, base_seed=base_seed,
+                         kl_subsample_M=kl_subsample_M)
 
 
 @register_kl(HypersphericalUniform, HypersphericalUniform)
@@ -264,13 +340,33 @@ def _kl_pathdistributions_son(p:SOnPathDistribution, q: SOnPathDistribution) -> 
     assert torch.all(p.basis == q.basis) and p.sigma == q.sigma, "Diffusion terms do not agree"
     kl0 = kl_divergence(p.p0, q.p0) # kl-div of initial values
 
-    drift = vec_to_matrix(p.Kt-q.Kt, p.basis)
+    M = getattr(p, 'kl_subsample_M', None)
+    N = len(p.dt)
     zi = p.zi if hasattr(p, 'zi') else p.rsample((p.kl_samples,))
-    projection = torch.einsum('ntij, ...ntj -> ...nti ',drift,zi[...,:-1,:])
-    norm_squared = projection.square().sum(dim=(-1)) # sum over spatial dimensions
 
-    kl_path = torch.einsum('...nt,t -> ...n', norm_squared, p.dt) / p.sigma.square()  # average over time
-    kl_path = kl_path.mean(dim=0) # average over samples
+    if M is None or M >= N:
+        # Full grid (original closed-form trapezoid sum).
+        Kt_p = _resolve_Kt(p)
+        Kt_q = _resolve_Kt(q)
+        drift = vec_to_matrix(Kt_p - Kt_q, p.basis)
+        projection = torch.einsum('ntij, ...ntj -> ...nti ', drift, zi[..., :-1, :])
+        norm_squared = projection.square().sum(dim=(-1))
+        kl_path = torch.einsum('...nt,t -> ...n', norm_squared, p.dt) / p.sigma.square()
+        kl_path = kl_path.mean(dim=0)
+        return kl_path, kl0
+
+    # Subsampled MC estimator: ∫₀^T ‖(K_p - K_q) z‖² / σ² dt
+    #                       ≈ (T/M) · Σ_{i=1..M} ‖(K_p(t_i) - K_q(t_i)) z(t_i)‖² / σ²
+    # The K closures are re-evaluated on the M sampled timepoints so that
+    # only M time_fn activations enter the autograd graph -- making the
+    # path-KL's tape O(M) rather than O(N).
+    Kt_p, Kt_q, zi_sub, T_over_M = _kl_subsample_setup(p, q, zi, M)
+    drift = vec_to_matrix(Kt_p - Kt_q, p.basis)        # (batch, M, dim, dim)
+    projection = torch.einsum('nmij, ...nmj -> ...nmi', drift, zi_sub)
+    norm_squared = projection.square().sum(dim=-1)     # (samples, batch, M)
+
+    kl_path = norm_squared.sum(dim=-1) * T_over_M / p.sigma.square()  # (samples, batch)
+    kl_path = kl_path.mean(dim=0)  # (batch,)
     return kl_path, kl0
 
 

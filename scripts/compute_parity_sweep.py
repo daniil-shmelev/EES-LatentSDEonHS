@@ -24,6 +24,7 @@ import os
 import sys
 import time
 from collections import defaultdict
+from typing import Optional
 
 import numpy as np
 import torch
@@ -118,15 +119,39 @@ def build_modules(args, device, num_classes, input_dim, solver_kind, adjoint):
     return modules
 
 
-def train_one(args, dl_trn, dl_val, dl_tst, modules, desired_t, device, n_epochs):
+def _save_checkpoint_atomic(path: str, payload: dict) -> None:
+    tmp = path + ".tmp"
+    torch.save(payload, tmp)
+    os.replace(tmp, path)
+
+
+def train_one(args, dl_trn, dl_val, dl_tst, modules, desired_t, device, n_epochs,
+              checkpoint_path: Optional[str] = None):
     elbo = ELBO(reduction="mean")
     aux_loss = PerTimePointCrossEntropyLoss(reduction="mean")
     optimizer = torch.optim.Adam(modules.parameters(), lr=args.lr)
     scheduler = CosineAnnealingLR(optimizer, args.restart, eta_min=0.0)
 
-    t0 = time.time()
+    start_epoch = 1
+    elapsed_before = 0.0
     final_train_loss = float("nan")
-    for ep in range(1, n_epochs + 1):
+
+    if checkpoint_path is not None and os.path.exists(checkpoint_path):
+        ckpt = torch.load(checkpoint_path, map_location=device, weights_only=False)
+        modules.load_state_dict(ckpt["modules"])
+        optimizer.load_state_dict(ckpt["optimizer"])
+        scheduler.load_state_dict(ckpt["scheduler"])
+        torch.set_rng_state(ckpt["torch_rng"].cpu())
+        if torch.cuda.is_available() and ckpt.get("cuda_rng") is not None:
+            torch.cuda.set_rng_state(ckpt["cuda_rng"].cpu())
+        start_epoch = int(ckpt["epoch"]) + 1
+        elapsed_before = float(ckpt["elapsed"])
+        final_train_loss = float(ckpt["final_train_loss"])
+        print(f"  [resume cell] from epoch {start_epoch - 1}/{n_epochs} "
+              f"({elapsed_before:.0f}s elapsed)", flush=True)
+
+    t0 = time.time()
+    for ep in range(start_epoch, n_epochs + 1):
         aux_w_mul = (ep / 60) ** 2 if ep < 60 else 1.0
         modules.train()
         loss_acc = 0.0
@@ -153,7 +178,19 @@ def train_one(args, dl_trn, dl_val, dl_tst, modules, desired_t, device, n_epochs
             n_acc += parts["evd_obs"].shape[0]
         scheduler.step()
         final_train_loss = loss_acc / max(n_acc, 1)
-    train_time_s = time.time() - t0
+
+        if checkpoint_path is not None:
+            _save_checkpoint_atomic(checkpoint_path, {
+                "epoch": ep,
+                "modules": modules.state_dict(),
+                "optimizer": optimizer.state_dict(),
+                "scheduler": scheduler.state_dict(),
+                "torch_rng": torch.get_rng_state(),
+                "cuda_rng": torch.cuda.get_rng_state() if torch.cuda.is_available() else None,
+                "final_train_loss": final_train_loss,
+                "elapsed": elapsed_before + (time.time() - t0),
+            })
+    train_time_s = elapsed_before + (time.time() - t0)
 
     # Eval
     modules.eval()
@@ -227,18 +264,79 @@ def main():
     parser.add_argument("--mc-train-samples", type=int, default=1)
     parser.add_argument("--mc-eval-samples", type=int, default=1)
     parser.add_argument("--data-dir", default="data_dir")
+    parser.add_argument(
+        "--resume", action="store_true",
+        help="If set and the output CSV already exists, skip (solver, B, seed) "
+             "cells already present. Useful for long runs that may be interrupted."
+    )
+    parser.add_argument(
+        "--checkpoint-dir", type=str, default=None,
+        help="If set, save a per-epoch training checkpoint (model, optimizer, "
+             "scheduler, RNG state) for each cell to <dir>/parity_<solver>_B<B>"
+             "_seed<seed>.pt. On a crash or reboot, re-running the script "
+             "resumes mid-cell from the last completed epoch (in addition to "
+             "the cell-level resume from --resume). Default ``<args.out>.ckpt`` "
+             "when ``--preset zeng2023`` is used; otherwise off."
+    )
+    parser.add_argument(
+        "--preset", choices=["default", "zeng2023"], default="default",
+        help="``zeng2023`` reproduces tab:sphere_parity with the published Zeng "
+             "et al. 2023 hyperparameters (990 epochs, 10 seeds, B=30) using the "
+             "original ELBO loss with no subsampling. Equivalent to: "
+             "--epochs 990 --seeds 0..9 --budgets 30 --resume "
+             "--out results/compute_parity_990epochs.csv. Other CLI args still "
+             "override (e.g. --device cuda:1)."
+    )
     args = parser.parse_args()
+    if args.preset == "zeng2023":
+        # Apply preset only to fields the user did NOT explicitly set, so
+        # --device/--data-dir/--batch-size etc. still override.
+        defaults = parser.parse_args([])
+        if args.epochs == defaults.epochs:
+            args.epochs = 990
+        if args.seeds == defaults.seeds:
+            args.seeds = list(range(10))
+        if args.budgets == defaults.budgets:
+            args.budgets = [30]
+        if args.out == defaults.out:
+            args.out = "results/compute_parity_990epochs.csv"
+        args.resume = True
+        if args.checkpoint_dir is None:
+            args.checkpoint_dir = args.out + ".ckpt"
 
     device = torch.device(args.device)
     os.makedirs(os.path.dirname(args.out), exist_ok=True)
+    if args.checkpoint_dir:
+        os.makedirs(args.checkpoint_dir, exist_ok=True)
     provider = HumanActivityProvider(args.data_dir)
 
+    # Resume support: load any rows that are already present in the output CSV.
     rows = []
+    done_keys = set()
+    if args.resume and os.path.exists(args.out):
+        with open(args.out, "r", newline="") as f:
+            reader = csv.DictReader(f)
+            for r in reader:
+                # Coerce numeric fields back to int/float for downstream consistency.
+                row = dict(r)
+                for k in ("B", "N", "seed"):
+                    if k in row:
+                        row[k] = int(row[k])
+                for k in ("test_elbo", "test_acc", "val_acc", "train_loss", "train_time_s"):
+                    if k in row and row[k] != "":
+                        row[k] = float(row[k])
+                rows.append(row)
+                done_keys.add((row["solver"], int(row["B"]), int(row["seed"])))
+        print(f"[resume] loaded {len(rows)} completed cells from {args.out}", flush=True)
+
     for B in args.budgets:
         for solver in args.solvers:
             N = n_for_budget(solver, B)
             print(f"\n=== B={B}, solver={solver}, N={N} ===", flush=True)
             for seed in args.seeds:
+                if (solver, B, seed) in done_keys:
+                    print(f"  seed={seed}: SKIP (already in CSV)", flush=True)
+                    continue
                 set_seed(seed + 1)
                 # Build coarser-grid datasets/loaders.
                 dl_trn = torch.utils.data.DataLoader(
@@ -259,8 +357,12 @@ def main():
                 modules = build_modules(args, device, provider.num_classes,
                                         provider.input_dim, solver, adjoint)
 
+                ckpt_path = (os.path.join(args.checkpoint_dir,
+                                          f"parity_{solver}_B{B}_seed{seed}.pt")
+                             if args.checkpoint_dir else None)
                 result = train_one(args, dl_trn, dl_val, dl_tst, modules,
-                                   desired_t, device, args.epochs)
+                                   desired_t, device, args.epochs,
+                                   checkpoint_path=ckpt_path)
                 row = {
                     "solver": solver, "B": B, "N": N, "seed": seed,
                     **result,
@@ -272,12 +374,18 @@ def main():
                     f"val_acc={result['val_acc']:.4f}  "
                     f"time={result['train_time_s']:.0f}s", flush=True,
                 )
-                # write incremental CSV so partial runs aren't lost
-                with open(args.out, "w", newline="") as f:
+                # Atomic write so an interruption mid-write can't corrupt the
+                # resume file: write to .tmp, then rename.
+                tmp_path = args.out + ".tmp"
+                with open(tmp_path, "w", newline="") as f:
                     w = csv.DictWriter(f, fieldnames=list(rows[0].keys()))
                     w.writeheader()
                     for r in rows:
                         w.writerow(r)
+                os.replace(tmp_path, args.out)
+                # Cell durably persisted -- safe to drop the per-epoch checkpoint.
+                if ckpt_path is not None and os.path.exists(ckpt_path):
+                    os.remove(ckpt_path)
                 del modules, dl_trn, dl_val, dl_tst, desired_t
                 gc.collect()
                 torch.cuda.empty_cache()
