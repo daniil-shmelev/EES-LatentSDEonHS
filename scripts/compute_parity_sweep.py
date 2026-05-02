@@ -125,8 +125,24 @@ def _save_checkpoint_atomic(path: str, payload: dict) -> None:
     os.replace(tmp, path)
 
 
+_EPOCH_LOG_FIELDS = ["solver", "B", "N", "seed", "epoch", "train_loss", "elapsed_s"]
+
+
+def _append_epoch_log(path: str, row: dict) -> None:
+    """Append one row to the per-epoch loss CSV. Single-line append is
+    POSIX-atomic on local filesystems, so this is safe under crash."""
+    file_exists = os.path.exists(path)
+    with open(path, "a", newline="") as f:
+        w = csv.DictWriter(f, fieldnames=_EPOCH_LOG_FIELDS)
+        if not file_exists:
+            w.writeheader()
+        w.writerow(row)
+
+
 def train_one(args, dl_trn, dl_val, dl_tst, modules, desired_t, device, n_epochs,
-              checkpoint_path: Optional[str] = None):
+              checkpoint_path: Optional[str] = None,
+              epoch_log_path: Optional[str] = None,
+              cell_meta: Optional[dict] = None):
     elbo = ELBO(reduction="mean")
     aux_loss = PerTimePointCrossEntropyLoss(reduction="mean")
     optimizer = torch.optim.Adam(modules.parameters(), lr=args.lr)
@@ -179,6 +195,7 @@ def train_one(args, dl_trn, dl_val, dl_tst, modules, desired_t, device, n_epochs
         scheduler.step()
         final_train_loss = loss_acc / max(n_acc, 1)
 
+        elapsed = elapsed_before + (time.time() - t0)
         if checkpoint_path is not None:
             _save_checkpoint_atomic(checkpoint_path, {
                 "epoch": ep,
@@ -188,7 +205,13 @@ def train_one(args, dl_trn, dl_val, dl_tst, modules, desired_t, device, n_epochs
                 "torch_rng": torch.get_rng_state(),
                 "cuda_rng": torch.cuda.get_rng_state() if torch.cuda.is_available() else None,
                 "final_train_loss": final_train_loss,
-                "elapsed": elapsed_before + (time.time() - t0),
+                "elapsed": elapsed,
+            })
+        if epoch_log_path is not None and cell_meta is not None:
+            _append_epoch_log(epoch_log_path, {
+                **cell_meta, "epoch": ep,
+                "train_loss": final_train_loss,
+                "elapsed_s": elapsed,
             })
     train_time_s = elapsed_before + (time.time() - t0)
 
@@ -248,6 +271,12 @@ def main():
     parser.add_argument("--out", default="results/compute_parity.csv")
     parser.add_argument("--budgets", type=int, nargs="*", default=DEFAULT_BUDGETS)
     parser.add_argument("--seeds", type=int, nargs="*", default=[0, 1])
+    parser.add_argument(
+        "--n-seeds", type=int, default=None,
+        help="Convenience override: if set, use seeds [0, 1, ..., n-seeds-1]. "
+             "Takes precedence over --seeds. Useful for batch submission "
+             "where you want N parallel seeds without listing them."
+    )
     parser.add_argument("--solvers", type=str, nargs="*", default=SOLVERS)
     parser.add_argument("--epochs", type=int, default=30)
     parser.add_argument("--batch-size", type=int, default=64)
@@ -294,6 +323,8 @@ def main():
              "override (e.g. --device cuda:1)."
     )
     args = parser.parse_args()
+    if args.n_seeds is not None:
+        args.seeds = list(range(args.n_seeds))
     if args.preset == "zeng2023":
         # Apply preset only to fields the user did NOT explicitly set, so
         # --device/--data-dir/--batch-size etc. still override.
@@ -314,6 +345,9 @@ def main():
     os.makedirs(os.path.dirname(args.out), exist_ok=True)
     if args.checkpoint_dir:
         os.makedirs(args.checkpoint_dir, exist_ok=True)
+    # Per-epoch loss log lives next to the main results CSV; one row per
+    # (solver, B, seed, epoch). Always-on -- it's a few KB per cell.
+    epoch_log_path = args.out.replace(".csv", "") + ".epoch_loss.csv"
     provider = HumanActivityProvider(args.data_dir, download=args.download)
 
     # Resume support: load any rows that are already present in the output CSV.
@@ -366,9 +400,12 @@ def main():
                 ckpt_path = (os.path.join(args.checkpoint_dir,
                                           f"parity_{solver}_B{B}_seed{seed}.pt")
                              if args.checkpoint_dir else None)
+                cell_meta = {"solver": solver, "B": B, "N": N, "seed": seed}
                 result = train_one(args, dl_trn, dl_val, dl_tst, modules,
                                    desired_t, device, args.epochs,
-                                   checkpoint_path=ckpt_path)
+                                   checkpoint_path=ckpt_path,
+                                   epoch_log_path=epoch_log_path,
+                                   cell_meta=cell_meta)
                 row = {
                     "solver": solver, "B": B, "N": N, "seed": seed,
                     **result,
@@ -397,6 +434,67 @@ def main():
                 torch.cuda.empty_cache()
 
     print(f"\nWrote {len(rows)} rows to {args.out}")
+    if os.path.exists(epoch_log_path):
+        plot_path = args.out.replace(".csv", "") + ".loss_curve.pdf"
+        plot_loss_curves(epoch_log_path, plot_path)
+
+
+def plot_loss_curves(epoch_log_path: str, out_path: str) -> None:
+    """Plot per-epoch training loss for each (solver, B, seed) cell.
+
+    Curves are coloured by solver (mean across seeds drawn solid; per-seed
+    curves drawn faint). Saves a single PDF next to the main results CSV.
+    """
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+
+    rows = []
+    with open(epoch_log_path, "r", newline="") as f:
+        for r in csv.DictReader(f):
+            rows.append({
+                "solver": r["solver"],
+                "B": int(r["B"]),
+                "seed": int(r["seed"]),
+                "epoch": int(r["epoch"]),
+                "train_loss": float(r["train_loss"]),
+            })
+    if not rows:
+        print(f"  no epoch records in {epoch_log_path}, skipping loss-curve plot")
+        return
+
+    by_solver_seed: dict = defaultdict(list)
+    for r in rows:
+        by_solver_seed[(r["solver"], r["B"], r["seed"])].append((r["epoch"], r["train_loss"]))
+
+    # Solver-level aggregation: align each seed's curve by epoch, average.
+    by_solver: dict = defaultdict(dict)  # (solver, B) -> {epoch: [losses]}
+    for (solver, B, seed), pts in by_solver_seed.items():
+        for ep, loss in pts:
+            by_solver[(solver, B)].setdefault(ep, []).append(loss)
+
+    color_for = {"geometric_euler": "#1f77b4", "cfees25": "#d62728"}
+    label_for = {"geometric_euler": "Geo-Euler", "cfees25": "CF-EES(2,5)"}
+
+    fig, ax = plt.subplots(figsize=(4.5, 3.0))
+    for (solver, B, seed), pts in sorted(by_solver_seed.items()):
+        pts.sort()
+        eps = [p[0] for p in pts]
+        ls = [p[1] for p in pts]
+        ax.plot(eps, ls, color=color_for.get(solver, "k"), alpha=0.25, linewidth=0.8)
+    for (solver, B), d in sorted(by_solver.items()):
+        eps = sorted(d.keys())
+        means = [sum(d[e]) / len(d[e]) for e in eps]
+        ax.plot(eps, means, color=color_for.get(solver, "k"), linewidth=1.8,
+                label=f"{label_for.get(solver, solver)} (B={B})")
+    ax.set_xlabel("Epoch")
+    ax.set_ylabel("Training loss")
+    ax.legend(loc="best", fontsize=9)
+    ax.grid(True, alpha=0.3)
+    fig.tight_layout()
+    fig.savefig(out_path, bbox_inches="tight")
+    plt.close(fig)
+    print(f"  wrote loss-curve plot to {out_path}")
 
 
 if __name__ == "__main__":

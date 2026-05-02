@@ -100,11 +100,10 @@ def plot_memory(csv_path: str, out_path: str) -> None:
         grouped[key].append((int(r["N"]), _to_float(r["peak_alloc_mib"]), r["status"]))
 
     # Plot order mirrors the RNA Figure 1: CFEES first (so it's not over-drawn),
-    # then the linear-tape baselines.
+    # then the linear-tape baseline.
     plot_order = [
         "cfees25/reversible",
         "geometric_euler/autograd",
-        "geometric_euler/checkpoint",
     ]
 
     fig, ax = plt.subplots(figsize=(3.2, 2.2))
@@ -127,21 +126,22 @@ def plot_memory(csv_path: str, out_path: str) -> None:
             label=SCALING_MODE_LABEL.get(key, key),
         )
 
-    # Reference O(n) line anchored to the rightmost point of the
-    # geometric-Euler curve (whose theoretical scaling it represents).
+    # Reference O(n) line: best-fit y = c*x in log-log to the geometric-Euler
+    # data, excluding the first (smallest-N) point. The first point sits at
+    # the constant-overhead floor and would bias the slope-1 fit toward zero.
     # CFEES gets an O(1) annotation against its own rightmost point.
     if "geometric_euler/autograd" in plotted:
         Ns, mibs = plotted["geometric_euler/autograd"]
-        # Anchor the O(n) reference to the slope between the first two large-N
-        # points (where the linear regime dominates) rather than to the
-        # constant-overhead small-N regime.
-        x_anchor, y_anchor = float(Ns[-1]), float(mibs[-1])
-        if Ns.size >= 2 and y_anchor > 0.0:
-            x_ref = np.asarray([float(Ns[0]), x_anchor])
-            y_ref = y_anchor * (x_ref / x_anchor)  # slope 1 in log-log
+        if Ns.size >= 3 and mibs.min() > 0.0:
+            # log_c = mean(log(y/x)) over the linear-regime points.
+            log_c = float(np.log(mibs[1:] / Ns[1:]).mean())
+            c = float(np.exp(log_c))
+            x_ref = np.asarray([float(Ns[0]), float(Ns[-1])])
+            y_ref = c * x_ref
             ax.plot(x_ref, y_ref, color="#444444", linewidth=1.2,
                     linestyle=":", alpha=1.0, zorder=1)
-            ax.annotate(r"$\mathcal{O}(n)$", xy=(x_anchor, y_anchor),
+            ax.annotate(r"$\mathcal{O}(n)$",
+                        xy=(float(Ns[-1]), float(mibs[-1])),
                         xytext=(12, 0), textcoords="offset points",
                         fontsize=9, color="black",
                         ha="left", va="center", annotation_clip=False)
@@ -158,6 +158,15 @@ def plot_memory(csv_path: str, out_path: str) -> None:
     ax.set_xlabel(r"$N$")
     ax.set_ylabel(r"Peak GPU memory (MiB)")
     ax.legend(loc="upper left", frameon=True, fontsize=7)
+
+    # Constrain y-limits to the data range so the extrapolated O(n) reference
+    # line, which extends below the leftmost data point, doesn't pull the
+    # axis floor down and waste vertical space.
+    if plotted:
+        all_mibs = np.concatenate([m for _, m in plotted.values()])
+        ymin = float(all_mibs.min()) / 1.5
+        ymax = float(all_mibs.max()) * 1.5
+        ax.set_ylim(ymin, ymax)
     fig.savefig(out_path, bbox_inches="tight", pad_inches=0.04)
     plt.close(fig)
     print(f"  wrote {out_path}")

@@ -1,6 +1,6 @@
 """Memory sweep: peak VRAM as a function of integrator-step count N.
 
-Sweeps three (solver, adjoint) cells across a range of N values, doing a single
+Sweeps two (solver, adjoint) cells across a range of N values, doing a single
 forward + backward pass through a synthetic mini-batch matched to the Human
 Activity model size (batch=64, z_dim=16, h_dim=128). Records
 ``torch.cuda.max_memory_allocated()`` per cell. CUDA OOMs are caught and
@@ -8,8 +8,7 @@ recorded as ``oom``.
 
 Cells:
 1. ``geometric_euler`` + autograd (full-tape baseline)
-2. ``geometric_euler`` + ``torch.utils.checkpoint`` (whole-integrator chunk)
-3. ``cfees25`` + reversible adjoint (the headline)
+2. ``cfees25`` + reversible adjoint (the headline)
 
 Output: ``results/memory_sweep.csv``.
 
@@ -27,7 +26,6 @@ from typing import Optional
 
 import torch
 import torch.nn as nn
-from torch.utils.checkpoint import checkpoint
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
@@ -46,7 +44,6 @@ from core.sde_solvers import geometric_euler
 N_VALUES = [50, 200, 800, 2000, 5000]
 CELLS = [
     ("geometric_euler", "autograd"),
-    ("geometric_euler", "checkpoint"),
     ("cfees25", "reversible"),
 ]
 # Number of observation timepoints per UCI HAR sequence -- fixed by the sensor
@@ -119,13 +116,7 @@ def run_cell(N: int, kind: str, adjoint: str, device: str, dtype: torch.dtype,
         solver = geometric_euler
     else:
         solver = kind  # string for dispatch
-    use_checkpoint = (adjoint == "checkpoint")
-    if use_checkpoint:
-        # checkpointed runs use plain solver (the integrator itself is unchanged;
-        # we wrap the *full forward pass* in torch.utils.checkpoint).
-        adjoint_for_encoder = "autograd"
-    else:
-        adjoint_for_encoder = adjoint
+    adjoint_for_encoder = adjoint
 
     modules = make_modules(
         device=device, solver=solver, adjoint=adjoint_for_encoder,
@@ -175,13 +166,7 @@ def run_cell(N: int, kind: str, adjoint: str, device: str, dtype: torch.dtype,
 
     try:
         modules.train()
-        if use_checkpoint:
-            # torch.utils.checkpoint requires a callable returning a Tensor.
-            # We wrap fwd, but fwd has no Tensor inputs -- use a dummy input
-            # marked use_reentrant=False so it works without a leaf input.
-            loss = checkpoint(lambda _x: fwd(), torch.zeros(1, device=device, requires_grad=True), use_reentrant=False)
-        else:
-            loss = fwd()
+        loss = fwd()
         optimizer.zero_grad()
         loss.backward()
         optimizer.step()
