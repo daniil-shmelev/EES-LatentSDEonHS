@@ -255,7 +255,7 @@ def main():
     # constant-factor savings achievable in actual Latent SDE training.
     if args.full_pipe_csv != args.memory_csv:
         plot_memory(args.full_pipe_csv, os.path.join(args.out_dir, "memory_full_pipeline.pdf"))
-    # Parity is reported as a table in the manuscript -- skip plot generation.
+    # Parity is reported as a table in the paper; skip plot generation.
 
 
 if __name__ == "__main__":

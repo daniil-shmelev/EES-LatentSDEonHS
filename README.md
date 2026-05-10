@@ -77,10 +77,9 @@ This code has been mainly tested on an Ubuntu Linux 22.04 with an Nvidia GTX 309
 
 # Experiments
 
-The following sections list the settings we used to run the
-experiments from the manuscript. In the configurations listed
-below, experiments are run on the first GPU in your system
-(`cuda:0`).
+The following sections list the settings used to reproduce the paper
+experiments. In the configurations listed below, experiments are run on the
+first GPU in your system (`cuda:0`).
 
 The `logs` directory will hold (if `--enable-file-logging` is set and a valid directory is provided with `--log-dir`) **two** files per experiment, tracking (experiment-specific) performance measures, i.e., a JSON  (`.json`) file as well as an exact replica of the console output (the `.txt` file). Each file is identified by a unique integer-valued experiment identifier.
 
@@ -197,7 +196,7 @@ Below are the results of **10** runs with different random seeds:
 ## Human Activity Classification
 
 For the human activity recognition experiment, just run the `activity_classification.py` script with default
-arguments. **Note**: different to the manuscript, we do reconstruct the input here at the available timepoints (and at all available coordinates). This is not necessary (as also pointed out by several prior works), but in that manner, all experiments are fully consistent in their setup.
+arguments. **Note**: unlike the published paper setup, this repository reconstructs the input at the available timepoints and coordinates. This is not necessary, as also pointed out by several prior works, but keeps all experiments fully consistent in their setup.
 
 ```bash
 python activity_classification.py \
