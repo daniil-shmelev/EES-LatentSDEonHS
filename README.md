@@ -27,6 +27,7 @@ We attach the [poster](/assets/NeurIPS23_poster.pdf) and [presentation slides](/
 # Overview
 
 - [Setup](#setup)
+- [Data](#data)
 - [Experiments](#experiments)
   - [Rotating MNIST](#rotating-mnist)
   - [Pendulum (Angle) Regression](#pendulum-angle-regression)
@@ -74,6 +75,22 @@ without any errors you are good to go.
 ### Test System
 
 This code has been mainly tested on an Ubuntu Linux 22.04 with an Nvidia GTX 3090 GPU, CUDA 12.1 (driver version 530.30.02 ) and PyTorch v2.1.1. We have also tested the code on a system running PyTorch 1.13 (CUDA 11.8).
+
+# Data
+
+All commands below assume you are running from `experiments/sphere_latent_sde/`
+and use the default `--data-dir data_dir`. The data directory is ignored by git.
+
+Online datasets used by this baseline:
+
+| Experiment | How to get the data |
+|---|---|
+| Rotating MNIST | `python rotating_mnist.py --data-dir data_dir ...` passes `download=True` to the provider and downloads `rot-mnist-3s.mat` into `data_dir/rot_mnist/` from `https://drive.google.com/uc?id=1Ax5swK4YtilC8DCxSHXOngcEZ71bH7hw`, the Google Drive file used by the ODE2VAE rotating-3s setup. |
+| Human Activity | Run `python -c "from data.activity_provider import HumanActivityProvider; HumanActivityProvider('data_dir', download=True)"`. This downloads `ConfLongDemo_JSI.txt` from `https://archive.ics.uci.edu/ml/machine-learning-databases/00196/ConfLongDemo_JSI.txt` and writes raw and processed files under `data_dir/PersonActivity/`. The `activity_classification.py` command expects this prepared directory. |
+| PhysioNet 2012 | `python physionet_interpolation.py --data-dir data_dir ...` constructs a `PhysioNetProvider`, which downloads `set-a.tar.gz`, `set-b.tar.gz`, and `Outcomes-a.txt` from `https://physionet.org/files/challenge-2012/1.0.0/` into `data_dir/PhysioNet/`. |
+
+The pendulum and irregular-sine experiments generate their data locally and do
+not require an external dataset download.
 
 # Experiments
 

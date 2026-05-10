@@ -4,9 +4,8 @@ loss on the trajectory. This isolates the integrator's autograd-tape cost
 from the rest of the Latent SDE training pipeline (which has its own
 O(N * dim^2) tape from the Girsanov closed-form path-KL formula).
 
-Mirrors the RNA torus memory-scaling setup used elsewhere in the paper, where
-CFEES + reversible adjoint stays flat across n_steps while full-tape solvers
-grow.
+This is the integrator-only memory-scaling setup: CFEES + reversible adjoint
+stays flat across n_steps while full-tape solvers grow.
 
 Output: ``results/memory_sweep_integrator.csv``.
 

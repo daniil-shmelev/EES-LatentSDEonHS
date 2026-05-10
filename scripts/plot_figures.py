@@ -32,9 +32,7 @@ DEFAULT_FULL_PIPE_CSV = os.path.join(REPO_ROOT, "results", "memory_sweep.csv")
 DEFAULT_PARITY_CSV = os.path.join(REPO_ROOT, "results", "compute_parity.csv")
 DEFAULT_OUT_DIR = os.path.join(REPO_ROOT, "figures")
 
-# Headline-figure style: matches the RNA torus memory plot
-# (experiments/rna/plots.py::fig_torus_scaling) so the two manifold-SDE
-# memory figures share a visual language.
+# Headline-figure style shared by the manifold-SDE memory figures.
 SCALING_MODE_LABEL = {
     "cfees25/reversible": r"CF-EES(2,5) + Reversible Adj.",
     "geometric_euler/autograd": r"Geo-Euler + Full Adj.",
@@ -79,8 +77,7 @@ def _to_float(s):
 
 
 def plot_memory(csv_path: str, out_path: str) -> None:
-    """Memory-vs-N plot in the same style as the RNA-torus Figure 1
-    (`experiments/rna/plots.py::fig_torus_scaling`).
+    """Memory-vs-N plot for the sphere latent SDE experiment.
 
     Plots absolute peak GPU memory in MiB on log-log axes. Reference
     slopes O(n), O(sqrt(n)) (where applicable) and O(1) annotations
@@ -99,8 +96,7 @@ def plot_memory(csv_path: str, out_path: str) -> None:
         key = f"{r['kind']}/{r['adjoint']}"
         grouped[key].append((int(r["N"]), _to_float(r["peak_alloc_mib"]), r["status"]))
 
-    # Plot order mirrors the RNA Figure 1: CFEES first (so it's not over-drawn),
-    # then the linear-tape baseline.
+    # Plot CFEES first so it remains visible against the linear-tape baseline.
     plot_order = [
         "cfees25/reversible",
         "geometric_euler/autograd",
